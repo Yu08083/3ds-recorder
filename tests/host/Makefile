@@ -1,5 +1,5 @@
 CC      ?= cc
-CFLAGS  := -std=c11 -Wall -Wextra -Werror -O2 -DBENCH_HOST \
+CFLAGS  := -std=c11 -Wall -Wextra -Werror -O2 -DBENCH_HOST -D_POSIX_C_SOURCE=200809L \
            -I../../libbench/include -I../benchplugin/Sources -I../../codec/include
 TESTS   := test_bench test_convert test_codec test_audio test_huff test_fused test_unwrap test_autostart test_front test_plgring test_appletguard test_join test_stats test_textbreak test_i18n
 
@@ -7,6 +7,7 @@ TESTS   := test_bench test_convert test_codec test_audio test_huff test_fused te
 
 test: $(TESTS)
 	@for t in $(TESTS); do ./$$t || exit 1; done
+	@python3 recorder_coexist.py
 
 test_bench: test_bench.c ../../libbench/source/bench.c ../../libbench/include/bench.h
 	$(CC) $(CFLAGS) -o $@ test_bench.c ../../libbench/source/bench.c -lm
