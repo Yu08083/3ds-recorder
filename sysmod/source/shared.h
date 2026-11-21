@@ -9,7 +9,8 @@
 #include <3ds/types.h>
 
 #define REC_SHARED_MAGIC   0x43455233u   /* "3REC" */
-#define REC_SHARED_VERSION 4u   /* 2: recovered, recoveredFile; 3: replay (REC_STATE_REPLAY, appBeat, clips); 4: autoState */
+#define REC_SHARED_VERSION 5u
+#define REC_BUILD_TAG 0x59550150u
 #define REC_TITLE_ID       0x0004013000F1D302ULL
 #define REC_PROCESS_NAME   "rec3ds"
 
@@ -42,6 +43,7 @@ typedef struct {
     u32 clips;              /* clips saved since start */
     char lastClip[32];
     volatile u32 autoState; /* launch on startup (config.ini autostart=on): REC_AUTO_* */
+    u32 buildTag;
 } RecShared;
 
 enum { REC_REPLAY_OK, REC_REPLAY_NO_SPACE, REC_REPLAY_NO_MEMORY, REC_REPLAY_WRITE_ERROR };

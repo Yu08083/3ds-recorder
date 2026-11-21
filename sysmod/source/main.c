@@ -33,7 +33,10 @@
 #include "convert.h"
 #include "r3d_format.h"
 #include "shared.h"
+#include "control.h"
+#include "ctrpf_display.h"
 #include "autostart.h"
+#include "launcher_order.h"
 #include "front.h"
 #include "plgring.h"
 #include "appletguard.h"
@@ -41,6 +44,7 @@
 /* Luma custom SVCs (csvc.s) */
 Result svcControlMemoryUnsafe(u32 *out, u32 addr0, u32 size, MemOp op, MemPerm perm);
 Result svcControlService(u32 op, ...);
+Result svcControlProcess(Handle process, u32 op, u32 out, u32 va);
 Result svcMapProcessMemoryEx(Handle dstProcess, u32 vaDst, Handle srcProcess, u32 vaSrc, u32 size, u32 flags);   /* Luma 0xA0 */
 Result svcUnmapProcessMemoryEx(Handle process, u32 va, u32 size);                                              /* Luma 0xA1 */
 
@@ -218,7 +222,7 @@ static const char *ScreensName(void)
 
 volatile RecShared g_shared __attribute__((aligned(0x1000), used)) = {
     REC_SHARED_MAGIC, REC_SHARED_VERSION, REC_STATE_STARTING, REC_CMD_NONE,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, { 0 }, 0, { 0 }, 0, 0, 0, 0, { 0 }, REC_AUTO_OFF,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, { 0 }, 0, { 0 }, 0, 0, 0, 0, { 0 }, REC_AUTO_OFF, REC_BUILD_TAG,
 };
 
 /* ------------------------------------------------------------------ init */
@@ -2534,7 +2538,40 @@ static bool RangeReadable(Handle proc, u32 va, u32 size)
     return true;
 }
 
-static Result StartFrameDma(Handle *dma, u8 *dst, u32 pa, u32 size)
+static bool StartCtrpfDisplayDma(Handle *dma, u8 *dst, Handle app, int sc, u32 pa,
+                                 u32 fmt, u32 stride, u32 size, DmaConfig *cfg, Result *rc)
+{
+    if (!ctrpf_display_layout(sc, fmt, stride, size) ||
+        pa < 0x20000000u || pa > 0x30000000u - size)
+        return false;
+    const u32 getPaFromVa = 4;
+    for (unsigned i = 0; i < 2; ++i)
+    {
+        const u32 va = ctrpf_display_buffer(sc, i);
+        u32 pixelPa = 0;
+        if (R_FAILED(svcControlProcess(app, getPaFromVa, (u32)&pixelPa, va)) || pixelPa != pa)
+            continue;
+        *rc = (Result)0xDEAD0026;
+        if (!RangeReadable(app, va, size))
+            return true;
+        for (u32 page = (va & ~0xFFFu) + 0x1000u; page < va + size; page += 0x1000u)
+        {
+            if (R_FAILED(svcControlProcess(app, getPaFromVa, (u32)&pixelPa, page)) ||
+                pixelPa != pa + (page - va))
+                return true;
+        }
+        const u32 base = PDC_VA(sc);
+        const u32 select = REG32(base + 0x78) & 1u;
+        if (REG32(base + 0x68 + select * 4u) != pa || REG32(base + 0x70) != fmt ||
+            REG32(base + 0x90) != stride || (REG32(base + 0x78) & 1u) != select)
+            return true;
+        *rc = svcStartInterProcessDma(dma, CUR_PROCESS_HANDLE, (u32)dst, app, va, size, cfg);
+        return true;
+    }
+    return false;
+}
+
+static Result StartFrameDma(Handle *dma, u8 *dst, int sc, u32 pa, u32 fmt, u32 stride, u32 size)
 {
     DmaConfig cfg;
     dmaConfigInitDefault(&cfg);
@@ -2547,7 +2584,8 @@ static Result StartFrameDma(Handle *dma, u8 *dst, u32 pa, u32 size)
     /* only the application's own FCRAM (APPLICATION region: kernel config page APPMEMALLOC); an
        applet's or HOME Menu's framebuffer there is not the application's to read */
     const u32 appEnd = 0x20000000u + *(const volatile u32 *)0x1FF80040;
-    if (pa + size > appEnd || pa + size < pa)
+    const bool inApp = pa <= appEnd && size <= appEnd - pa;
+    if (!inApp && !ctrpf_display_layout(sc, fmt, stride, size))
     {
         static u32 lastMb;
         if (g_recording && (pa >> 20) != lastMb)
@@ -2570,8 +2608,18 @@ static Result StartFrameDma(Handle *dma, u8 *dst, u32 pa, u32 size)
     Handle app = 0;
     if (R_FAILED(svcOpenProcess(&app, g_appPid)) && (!FindApp() || R_FAILED(svcOpenProcess(&app, g_appPid))))
         return (Result)0xDEAD0021;
-    static const u32 bases[2] = { 0x14000000u, 0x30000000u };
     Result rc = (Result)0xDEAD0022;
+    if (StartCtrpfDisplayDma(dma, dst, app, sc, pa, fmt, stride, size, &cfg, &rc))
+    {
+        svcCloseHandle(app);
+        return rc;
+    }
+    if (!inApp)
+    {
+        svcCloseHandle(app);
+        return (Result)0xDEAD0023;
+    }
+    static const u32 bases[2] = { 0x14000000u, 0x30000000u };
     for (u32 i = 0; i < 2; i++)
     {
         const u32 base = g_appBase ? g_appBase : bases[i];
@@ -2635,32 +2683,34 @@ static u32 DmasRunning(void)
     return n;
 }
 
-static void Capture(int sc, u32 pa, u32 fmt, u32 stride, u32 timeUs, bool isStatic)
+typedef enum { FRAME_QUEUED, FRAME_BUSY, FRAME_UNREADABLE } FrameResult;
+
+static FrameResult Capture(int sc, u32 pa, u32 fmt, u32 stride, u32 timeUs, bool isStatic)
 {
     if ((fmt & 7u) > FB_RGBA4)
-        return;   /* not a pixel format: a register read while the game set its screens up */
+        return FRAME_UNREADABLE;
     /* the stride bounded first: a garbage register value times 400 could wrap to a small size */
     if (stride < 240 * Bpp(fmt) || stride > 240u * 4u * 2u)
-        return;
+        return FRAME_UNREADABLE;
     /* nor an unaligned one: the encoders read whole words at column starts (a data abort) */
     if (stride & 7u)
-        return;
+        return FRAME_UNREADABLE;
     /* the top screen's 800 px mode: neither "normal 2D" (bit 6) nor 3D (bit 5) in its format
        register (as Rosalina's screenshots read it); 800 columns, recorded as 400 (pairs averaged) */
     const bool wide = sc == 0 && (fmt & 0x60u) == 0;
     const u32 size = (sc == 0 ? (wide ? 800u : 400u) : 320u) * stride;
     if (size > g_arenaCap[sc])
-        return;
+        return FRAME_UNREADABLE;
     if (!EnsureSlots(sc, size))
     {
         Drop(DROP_SLOTS_BUSY, sc, 0);
-        return;
+        return FRAME_BUSY;
     }
     const u32 running = DmasRunning();
     if (running >= DMA_MAX_RUNNING)
     {
         Drop(DROP_DMA_LIMIT, sc, 0);   /* not encoded: no keyframe needed */
-        return;
+        return FRAME_BUSY;
     }
     Slot *slot = NULL;
     for (u32 i = 0; i < g_slotCount[sc] && !slot; i++)
@@ -2669,15 +2719,15 @@ static void Capture(int sc, u32 pa, u32 fmt, u32 stride, u32 timeUs, bool isStat
     if (!slot)
     {
         Drop(DROP_NO_SLOT, sc, 0);   /* not encoded: no keyframe needed */
-        return;
+        return FRAME_BUSY;
     }
     Handle h = 0;
-    const Result rc = StartFrameDma(&h, slot->buf, pa, size);
+    const Result rc = StartFrameDma(&h, slot->buf, sc, pa, fmt, stride, size);
     if (R_FAILED(rc))
     {
         g_dmaStartRc = rc;
         Drop(DROP_DMA_START, sc, rc);
-        return;
+        return FRAME_UNREADABLE;
     }
     slot->dma = h;
     slot->screen = (u8)sc;
@@ -2692,6 +2742,7 @@ static void Capture(int sc, u32 pa, u32 fmt, u32 stride, u32 timeUs, bool isStat
     if (running + 1 > g_dmaMaxRunning)
         g_dmaMaxRunning = running + 1;
     LightEvent_Signal(&g_convEvent);
+    return FRAME_QUEUED;
 }
 
 typedef struct {
@@ -2821,7 +2872,8 @@ static u32 PollScreens(void)
         Track *t = &g_track[sc];
         const u32 fps = sc == 1 ? bottomFps : g_cfg.fps;
         const u32 gapUs = 1000000u / fps - (fps > 12u ? 8000u : 0u);   /* 30 fps -> 25 ms: tolerates 60 Hz jitter */
-        if (fmt != t->lastFmt || stride != t->lastStride || IsVram(cur) != t->vram)   /* a mode change (800 px, 3D, a program's own) */
+        const bool modeChanged = fmt != t->lastFmt || stride != t->lastStride || IsVram(cur) != t->vram;
+        if (modeChanged)
         {
             t->lastFmt = fmt;
             t->lastStride = stride;
@@ -2831,7 +2883,7 @@ static u32 PollScreens(void)
                 Log("%s screen: format %03lX stride %lu at %s pa %08lX, %lu s", sc ? "bottom" : "top", fmt, stride,
                     IsVram(cur) ? "VRAM" : "FCRAM", cur, (u32)(nowUs / 1000000u));
         }
-        const bool isNew = cur != t->lastAddr || sel != t->lastSel;
+        const bool isNew = modeChanged || cur != t->lastAddr || sel != t->lastSel;
         if (isNew)
         {
             if (t->hasCap && nowUs - t->lastRealUs < TORN_US)
@@ -2868,13 +2920,13 @@ static u32 PollScreens(void)
         const u32 phase = (u32)((nowUs - t->lastNewUs) % VBLANK_US);
         const bool late = !isNew && t->pend && t->precise && t->hasCap && nowUs - t->lastCapUs >= 1000000u / fps &&
                           phase >= LATE_AFTER_US && phase <= VBLANK_US - LATE_BEFORE_US;
-        if (!(due && (isNew || isStatic || late)))
+        const bool settledSwap = t->pend && nowUs - t->lastNewUs >= STATIC_GAP_US;
+        if (!(due && (isNew || isStatic || late || settledSwap)))
             continue;
         if (t->hasCap && nowUs - t->modeUs < MODE_SETTLE_US)
             continue;   /* the screen's mode just changed: let it settle */
         t->lastCapUs = nowUs;
         t->hasCap = true;
-        t->pend = false;
         /* a bottom screen already at its own low rate (bottom_fps) gives up no more frames when the
            card is behind, only when the ring is nearly full: it costs little, and 5 fps would become 2 */
         const bool lowBottom = sc == 1 && bottomFps < g_cfg.fps;
@@ -2909,8 +2961,10 @@ static u32 PollScreens(void)
         }
         if (sc == 1 && g_cfg.top && BusySlots(0) >= 2 && nowUs - t->lastRealUs < BOTTOM_MIN_GAP_US)
             continue;   /* top screen first, but the bottom keeps 10 fps */
-        t->lastRealUs = nowUs;
-        Capture(sc, cur, fmt, stride, (u32)nowUs, isStatic);
+        FrameResult result = Capture(sc, cur, fmt, stride, (u32)nowUs, isStatic);
+        t->pend = result == FRAME_BUSY;
+        if (result == FRAME_QUEUED)
+            t->lastRealUs = nowUs;
     }
     g_lastPollUs = nowUs;
     /* a game faster than the recording: every poll, so its swaps' times are known (late captures) */
@@ -3780,20 +3834,7 @@ static void UpdateBoost(void)
 #define LAUNCH_3GX_FS   DIR_FS "/rec3ds-launch.3gx"
 #define USER_PARAM_FS   "/luma/plugins/user_param.bin"
 #define PLG_BY_US_FS    DIR_FS "/.plugin_loader_on"   /* the recorder turned the plugin loader on */
-#define USER_PARAM_MAGIC 0x53524550u                    /* "PERS", Rosalina plgloader.c */
-#define ORDER_RESUME     0x52455331u                    /* config[0]: a recording was running ("RES1") */
-
-/* Rosalina's PluginLoadParameters (sysmodules/rosalina/include/plugin/plgldr.h) */
-typedef struct {
-    u8 noFlash;
-    u8 memoryStrategy;   /* 0 swap (to SD while HOME is open), 1 mode3, 2 none */
-    u8 persistent;
-    u8 pad;
-    u32 lowTitleId;      /* 0: any title */
-    char path[256];
-    u32 config[32];
-} PluginLoadParams;
-_Static_assert(sizeof(PluginLoadParams) == 392, "PluginLoadParameters layout");
+#define ORDER_TMP_FS     DIR_FS "/.launcher-order.tmp"
 
 static bool g_powerOffSeen;        /* 0x108 came: a power-off, not a game's reboot */
 static bool g_plgQuiet;            /* PluginLoader: no log line for a port that is not there yet (EarlyLoader) */
@@ -3926,18 +3967,59 @@ static bool SdFileExists(const char *path)
 static int ReadUserParam(u32 *tidLow, bool *resume)
 {
     Handle f = 0;
-    if (R_FAILED(FSUSER_OpenFile(&f, g_sd, fsMakePath(PATH_ASCII, USER_PARAM_FS), FS_OPEN_READ, 0)))
-        return 0;
-    struct { u32 magic; PluginLoadParams p; } buf;
+    Result rc = FSUSER_OpenFile(&f, g_sd, fsMakePath(PATH_ASCII, USER_PARAM_FS), FS_OPEN_READ, 0);
+    if (R_FAILED(rc))
+        return R_SUMMARY(rc) == RS_NOTFOUND ? 0 : -1;
+    RecorderLauncherOrder buf;
     u32 got = 0;
-    const bool ok = R_SUCCEEDED(FSFILE_Read(f, &got, 0, &buf, sizeof(buf))) && got == sizeof(buf) &&
-                    buf.magic == USER_PARAM_MAGIC && strcmp(buf.p.path, LAUNCH_3GX_FS) == 0;
+    u64 size = 0;
+    const bool ok = R_SUCCEEDED(FSFILE_GetSize(f, &size)) && size == sizeof(buf) &&
+                    R_SUCCEEDED(FSFILE_Read(f, &got, 0, &buf, sizeof(buf))) && got == sizeof(buf) &&
+                    RecorderOwnsOrder(&buf);
     FSFILE_Close(f);
     if (ok && tidLow)
         *tidLow = buf.p.lowTitleId;
     if (ok && resume)
         *resume = buf.p.config[0] == ORDER_RESUME;
     return ok ? 1 : -1;
+}
+
+static bool GameHasPlugin(u64 tid)
+{
+    Handle file = 0, dir = 0;
+    Result rc = FSUSER_OpenFile(&file, g_sd, fsMakePath(PATH_ASCII, "/luma/plugins/default.3gx"), FS_OPEN_READ, 0);
+    if (R_SUCCEEDED(rc))
+    {
+        FSFILE_Close(file);
+        return true;
+    }
+    if (R_SUMMARY(rc) != RS_NOTFOUND)
+        return true;
+    char path[48];
+    snprintf(path, sizeof(path), "/luma/plugins/%016llX", (unsigned long long)tid);
+    rc = FSUSER_OpenDirectory(&dir, g_sd, fsMakePath(PATH_ASCII, path));
+    if (R_FAILED(rc))
+        return R_SUMMARY(rc) != RS_NOTFOUND;
+    FS_DirectoryEntry entry;
+    u32 count = 0;
+    bool found = false;
+    unsigned scanned = 0;
+    while (scanned < 32 && R_SUCCEEDED(rc = FSDIR_Read(dir, &count, 1, &entry)) && count)
+    {
+        ++scanned;
+        if ((entry.attributes & FS_ATTRIBUTE_DIRECTORY) || entry.name[0] == '.')
+            continue;
+        size_t n = 0;
+        while (n < sizeof(entry.name) / sizeof(entry.name[0]) && entry.name[n]) ++n;
+        if (n > 4 && entry.name[n-4] == '.' && entry.name[n-3] == '3' &&
+            (entry.name[n-2] == 'g' || entry.name[n-2] == 'G') && (entry.name[n-1] == 'x' || entry.name[n-1] == 'X'))
+        {
+            found = true;
+            break;
+        }
+    }
+    FSDIR_Close(dir);
+    return found || R_FAILED(rc) || scanned == 32;
 }
 
 /* At start: in which memory mode, whether the launcher plugin started us; removes our order.
@@ -3948,6 +4030,12 @@ static bool AfterReboot(void)
     u32 tidLow = 0;
     bool resume = false;
     const int order = ReadUserParam(&tidLow, &resume);
+    if (g_isNew3ds)
+    {
+        if (order > 0) FSUSER_DeleteFile(g_sd, fsMakePath(PATH_ASCII, USER_PARAM_FS));
+        FSUSER_DeleteFile(g_sd, fsMakePath(PATH_ASCII, PLG_BY_US_FS));
+        return false;
+    }
     /* started with the console: the game and its plugin come later, AfterPluginUp cleans up
        (EarlyLoader has already taken back an order for a game in the no-plugin list) */
     const bool keep = g_bootStart && mode != 0 && mode < 6 && order > 0;
@@ -3955,7 +4043,8 @@ static bool AfterReboot(void)
     g_plgTid = order > 0 && mode != 0 && mode < 6 ? tidLow : 0;
     if (order > 0 && !keep)
         FSUSER_DeleteFile(g_sd, fsMakePath(PATH_ASCII, USER_PARAM_FS));
-    const bool weTurnedOn = !keep && SdFileExists(PLG_BY_US_FS);
+    const bool weTurnedOn = !keep && order > 0 && SdFileExists(PLG_BY_US_FS);
+    if (!keep && order <= 0) FSUSER_DeleteFile(g_sd, fsMakePath(PATH_ASCII, PLG_BY_US_FS));
     if (weTurnedOn && PluginLoader(0) == 0)   /* the record goes only once the loader is off */
         FSUSER_DeleteFile(g_sd, fsMakePath(PATH_ASCII, PLG_BY_US_FS));
     Log("memory mode %lu (%s): APPLICATION %lu KB, SYSTEM free %lu KB of %lu KB, BASE free %lu KB; launcher order %s%s",
@@ -3966,7 +4055,7 @@ static bool AfterReboot(void)
     if (order > 0)
         Log("launcher order was for title %08lX%s", tidLow, resume ? ": the recording goes on in 2 s" : "");
     /* only right after that game's reboot (an old order must not start a recording in another one) */
-    resume = resume && order > 0 && mode != 0;
+    resume = resume && g_plgTid != 0;
     if (resume)   /* the recording that game's start stopped goes on: nothing to explain in the app */
         FSUSER_DeleteFile(g_sd, fsMakePath(PATH_ASCII, STOPPED_FS));
     return resume;
@@ -4029,12 +4118,12 @@ static void WriteGameOrder(bool wasRecording)
         g_order.skip = "no launcher plugin " LAUNCH_3GX_FS;
         return;
     }
-    if (ReadUserParam(NULL, NULL) < 0)
+    if (ReadUserParam(NULL, NULL) != 0 || GameHasPlugin(g_order.tid))
     {
-        g_order.skip = USER_PARAM_FS " belongs to another program";
+        g_order.skip = "game plugin or pending loader order";
         return;
     }
-    struct { u32 magic; PluginLoadParams p; } buf;
+    RecorderLauncherOrder buf;
     memset(&buf, 0, sizeof(buf));
     buf.magic = USER_PARAM_MAGIC;
     buf.p.noFlash = 1;
@@ -4045,19 +4134,27 @@ static void WriteGameOrder(bool wasRecording)
     buf.p.persistent = 0;
     buf.p.lowTitleId = (u32)g_order.tid;
     buf.p.config[0] = wasRecording ? ORDER_RESUME : 0;
+    buf.p.config[1] = ORDER_OWNER;
+    buf.p.config[2] = buf.p.lowTitleId;
     snprintf(buf.p.path, sizeof(buf.p.path), "%s", LAUNCH_3GX_FS);
     FSUSER_CreateDirectory(g_sd, fsMakePath(PATH_ASCII, "/luma/plugins"), 0);
-    const FS_Path p = fsMakePath(PATH_ASCII, USER_PARAM_FS);
+    const FS_Path p = fsMakePath(PATH_ASCII, ORDER_TMP_FS);
     FSUSER_DeleteFile(g_sd, p);
     Handle f = 0;
     g_order.rc = FSUSER_OpenFile(&f, g_sd, p, FS_OPEN_WRITE | FS_OPEN_CREATE, 0);
     if (R_SUCCEEDED(g_order.rc))
     {
         g_order.rc = FSFILE_Write(f, &g_order.done, 0, &buf, sizeof(buf), FS_WRITE_FLUSH);
-        FSFILE_Close(f);
+        const Result closed = FSFILE_Close(f);
+        if (R_SUCCEEDED(g_order.rc)) g_order.rc = closed;
     }
+    if (R_SUCCEEDED(g_order.rc) && g_order.done == sizeof(buf))
+        g_order.rc = FSUSER_RenameFile(g_sd, p, g_sd, fsMakePath(PATH_ASCII, USER_PARAM_FS));
     if (R_FAILED(g_order.rc) || g_order.done != sizeof(buf))
+    {
+        FSUSER_DeleteFile(g_sd, p);
         g_order.skip = "writing failed";
+    }
 }
 
 /* After the recording is saved: the log line, and the plugin loader on if it is off. */
@@ -4587,9 +4684,9 @@ static void EarlyLoader(void)
     const u32 mode = OS_KernelConfig->app_memtype;
     u32 tidLow = 0;
     bool resume = false;
-    if (!g_bootStart || !g_sd || mode == 0 || mode >= 6 || ReadUserParam(&tidLow, &resume) <= 0)
+    if (g_isNew3ds || !g_bootStart || !g_sd || mode == 0 || mode >= 6 || ReadUserParam(&tidLow, &resume) <= 0)
         return;
-    if (NoPlugin(tidLow))   /* the game needs all of its memory: the order is taken back */
+    if (NoPlugin(tidLow) || GameHasPlugin(0x0004000000000000ull | tidLow))
     {
         u32 tries = 0;
         bool ok = false;
@@ -4630,7 +4727,8 @@ static void AfterPluginUp(const char *why)
     const int order = ReadUserParam(NULL, NULL);
     if (order > 0)
         FSUSER_DeleteFile(g_sd, fsMakePath(PATH_ASCII, USER_PARAM_FS));
-    const bool weTurnedOn = SdFileExists(PLG_BY_US_FS);
+    const bool weTurnedOn = order > 0 && SdFileExists(PLG_BY_US_FS);
+    if (order <= 0) FSUSER_DeleteFile(g_sd, fsMakePath(PATH_ASCII, PLG_BY_US_FS));
     if (weTurnedOn && PluginLoader(0) == 0)   /* the record goes only once the loader is off */
         FSUSER_DeleteFile(g_sd, fsMakePath(PATH_ASCII, PLG_BY_US_FS));
     Log("launcher order %s (%s)%s", order > 0 ? "removed" : "already gone", why, weTurnedOn ? "; plugin loader turned off again" : "");
@@ -4807,12 +4905,18 @@ static bool MapPluginMemory(void)
     const u32 mode = OS_KernelConfig->app_memtype;
     if (mode == 0 || mode >= 6 || (*(const volatile u32 *)0x1FF800F0 & 0xFFFFu) == 0)
         return false;   /* not an extended-memory game on an Old 3DS, or no plugin in it */
-    if (!g_plgTid)
+    if (g_isNew3ds || !g_plgTid)
         return false;   /* a plugin of someone else's (no order of ours this start): its heap is its own */
     const u32 pid = ApplicationPid();
     Handle game = 0;
     if (!pid || R_FAILED(svcOpenProcess(&game, pid)))
         return false;
+    s64 gameTitle = 0;
+    if (R_FAILED(svcGetProcessInfo(&gameTitle, game, 0x10001)) || (u64)gameTitle != (0x0004000000000000ull | g_plgTid))
+    {
+        svcCloseHandle(game);
+        return false;
+    }
     u32 magic = 0, heapVa = 0, heapSize = 0;
     Result rc = svcMapProcessMemoryEx(CUR_PROCESS_HANDLE, PLG_HDR_VA, game, 0x07000000u, 0x1000u, 0);
     if (R_SUCCEEDED(rc))
@@ -4821,8 +4925,10 @@ static bool MapPluginMemory(void)
         magic = h[0];
         heapVa = h[2];
         heapSize = h[3];
+        const volatile u32 *config = h + 0x80 / sizeof(*h);
+        const bool ownLauncher = config[1] == ORDER_OWNER && config[2] == g_plgTid;
         svcUnmapProcessMemoryEx(CUR_PROCESS_HANDLE, PLG_HDR_VA, 0x1000u);
-        if (magic != PLG_MAGIC || heapSize < MB || heapSize > 16u * MB || (heapVa & 0xFFFu))
+        if (!ownLauncher || magic != PLG_MAGIC || heapSize < MB || heapSize > 16u * MB || (heapVa & 0xFFFu))
             rc = -1;
         else
             /* MAPEXFLAGS_PRIVATE: mapped like our own heap (0xBB05), so FS writes and DMA accept it */
@@ -6002,6 +6108,7 @@ int main(void)
     /* highest non-privileged priority: a poll late by more than ~6 ms loses a frame
        (v5: ~1 per second at 0x20); it only reads 1.3 KB per ms */
     Thread audio = threadCreate(AudioMain, NULL, 4 * KB, 0x18, 1, false);
+    Control_Start();
     if (!writer || !conv || !audio || !pack)
     {
         g_shared.state = REC_STATE_ERROR;
@@ -6016,6 +6123,7 @@ int main(void)
             svcSleepThread(50 * 1000 * 1000);
         }
         g_shared.state = REC_STATE_EXITED;
+        Control_Stop();
         return 0;
     }
     s64 luma = 0, n3ds = 0;
@@ -6582,6 +6690,7 @@ int main(void)
     LedOff();
     Log(systemEnd ? "recorder ended by the system (power-off or reboot)" : "recorder exited");
     g_shared.state = REC_STATE_EXITED;
+    Control_Stop();
     /* the writer and converter threads are idle; the process exit ends them */
     if (g_sd)
         FSUSER_CloseArchive(g_sd);

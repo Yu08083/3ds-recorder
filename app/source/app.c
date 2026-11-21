@@ -322,6 +322,12 @@ static void tell_system_stop(App *a)
 
 static void apply_language(App *a);
 
+static bool update_ready(const App *a)
+{
+    return a->st.running && a->st.readable && (!a->st.currentBuild || a->moduleFile != MODULE_SAME) &&
+           (a->st.state == REC_STATE_IDLE || a->st.state == REC_STATE_REPLAY || a->st.state == REC_STATE_ERROR);
+}
+
 void app_init(App *a, const char *selfPath)
 {
     memset(a, 0, sizeof(*a));
@@ -354,8 +360,7 @@ void app_init(App *a, const char *selfPath)
        screen come up, to say what to change. */
     /* After an app update the running module is the older one: it is restarted with the new one
        (only when idle: a recording is never cut for it). */
-    const bool outdated = a->st.running && a->moduleFile == MODULE_DIFFERENT &&
-                          (a->st.state == REC_STATE_IDLE || a->st.state == REC_STATE_REPLAY);
+    const bool outdated = update_ready(a);
     const bool autoStart = (!a->st.running || outdated) && a->lumaModules;
     if (a->cfg.guideSeen) /* else after the first run's language and guide (in its language) */
         tell_system_stop(a);
@@ -363,7 +368,8 @@ void app_init(App *a, const char *selfPath)
             "%lu recordings (%llu MB)%s",
             n3ds ? "New 3DS" : "Old 3DS", LANGS[a->cfg.lang].code, a->cfg.guideSeen ? "seen" : "first run",
             a->st.running ? "running" : "not running", (unsigned long)a->st.state,
-            a->moduleFile == MODULE_SAME ? "same" : a->moduleFile == MODULE_DIFFERENT ? "different" : "missing",
+            a->moduleFile == MODULE_SAME ? "same" : a->moduleFile == MODULE_DIFFERENT ? "different" :
+            a->moduleFile == MODULE_UNREADABLE ? "SD error" : "missing",
             a->lumaModules ? "on" : "OFF", (unsigned long)a->sdFreeMb, (unsigned long)a->files.count,
             (unsigned long long)(a->files.bytes >> 20), outdated ? ", outdated module: restarting it" : "");
     if (autoStart) {
@@ -860,7 +866,7 @@ static void panel_activate(App *a, int tile)
     if (tile == 0) {
         if (a->st.running && a->st.state == REC_STATE_RECORDING)
             recorder_command(REC_CMD_STOP);
-        else if (a->st.running) {
+        else if (a->st.running && !update_ready(a)) {
             a->pending = ACT_STOP;
             a->busy = T(S_STATE_STOPPING);
         } else {
@@ -1806,9 +1812,9 @@ static void draw_firstrun_top(App *a)
     check_row(58, v != 0, v == 0, T(S_FR_LUMA), v ? val : T(S_FR_LUMA_UNKNOWN));
     check_row(89, a->lumaModules, !a->lumaModules, T(S_FR_OPTION), T(a->lumaModules ? S_FR_ON : S_FR_OFF));
     check_row(120, a->moduleFile == MODULE_SAME, false, T(S_FR_MODULE),
-              T(a->moduleFile == MODULE_SAME ? S_FR_MODULE_OK
-                : a->moduleFile == MODULE_DIFFERENT ? S_FR_MODULE_UPDATE
-                                                    : S_FR_MODULE_MISSING));
+              T(a->moduleFile == MODULE_SAME ? S_FR_MODULE_OK :
+                a->moduleFile == MODULE_DIFFERENT ? S_FR_MODULE_UPDATE :
+                a->moduleFile == MODULE_UNREADABLE ? S_STATE_ERROR : S_FR_MODULE_MISSING));
     check_row(151, a->st.running, !a->st.running, T(S_FR_RUNNING), a->st.running ? T(S_FR_ON) : T(S_FR_RUNNING_NO));
     format_gb(gb, sizeof(gb), a->sdFreeMb);
     snprintf(val, sizeof(val), T(S_FR_SD_FREE), gb);
@@ -2321,9 +2327,9 @@ static void draw_panel_bottom(App *a)
         /* two switches in one card: the recorder, and under a hairline its replay buffer */
         ui_card(t.x, t.y, t.w, t.h, 10, COL_SURFACE);
         ui_text(t.x + 10, t.y + 9, 11, FONT_BOLD, COL_TEXT, T(S_TILE_RECORDER));
-        ui_toggle(t.x + t.w - 42, t.y + 8, a->st.running);
+        ui_toggle(t.x + t.w - 42, t.y + 8, a->st.running && !update_ready(a));
         ui_text(t.x + 10, t.y + 27, 9, FONT_REG, COL_MUTED,
-                T(a->st.running ? S_TILE_RECORDER_ON_SHORT : S_TILE_RECORDER_OFF_SHORT));
+                T(update_ready(a) ? S_FR_MODULE_UPDATE : a->st.running ? S_TILE_RECORDER_ON_SHORT : S_TILE_RECORDER_OFF_SHORT));
         ui_rect(t.x + 10, t.y + 46.5f, t.w - 20, 1, COL_SURFACE2);
         const Rect r = TILE_REPLAY;
         char hk[48];

@@ -40,7 +40,7 @@ static size_t round_trip(const uint8_t *in, size_t n)
 
 static void test_edges(void)
 {
-    uint8_t b[4096];
+    uint8_t b[4096] = {0};
     round_trip(b, 0);
     b[0] = 7;
     round_trip(b, 1);

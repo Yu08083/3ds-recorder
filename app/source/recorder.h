@@ -40,11 +40,11 @@ typedef struct {
 } AppConsole;
 const AppConsole *app_console(void);
 
-typedef enum { MODULE_MISSING, MODULE_DIFFERENT, MODULE_SAME } ModuleFile;
+typedef enum { MODULE_MISSING, MODULE_DIFFERENT, MODULE_SAME, MODULE_UNREADABLE } ModuleFile;
 
 /* What the module reports through its shared page, plus whether it runs at all. */
 typedef struct {
-    bool running, readable;
+    bool running, readable, currentBuild;
     u32 state;               /* REC_STATE_* */
     u32 recSeconds, recKb, framesTop, framesBot, dropped, files;
     Result lastError;

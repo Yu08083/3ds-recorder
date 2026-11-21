@@ -16,7 +16,7 @@ TARGET          := 3ds-recorder
 APP_VERSION := 1.5.0
 CIA_VERSION := 1.5.1
 # "beta" for the open beta, empty for a release: shown next to the version on the panel
-APP_CHANNEL     := Yu_y01
+APP_CHANNEL     := ver.y01
 APP_TITLE       := 3DS Recorder
 APP_DESCRIPTION := Records the whole console
 APP_AUTHOR      := 3ds-screen-recorder
@@ -64,6 +64,7 @@ export _3DSXFLAGS += --smdh=$(CURDIR)/$(TARGET).smdh --romfs=$(CURDIR)/romfs
 
 .PHONY: all clean cia
 all: $(BUILD)
+	@python3 ../tools/romfs-notices.py
 	@cp -p ../sysmod/rec3ds.cxi romfs/rec3ds.cxi
 	@cp -p ../plugin/rec3ds-launch.3gx romfs/rec3ds-launch.3gx
 	@python3 ../tools/build-web.py ../web romfs/web/index.html.gz

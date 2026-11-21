@@ -43,8 +43,8 @@ https://github.com/user-attachments/assets/122e7c76-d4c6-4f60-9426-aeed7d322776
 
 ## Встановлення
 
-1. Завантажте `3ds-recorder.cia` (або `.3dsx`) з [останнього релізу](https://github.com/BolgarMaxym97/3ds-recorder/releases/latest).
-2. Скопіюйте на SD-картку. `.cia` встановіть через FBI (SD → файл → **Install CIA**); `.3dsx` покладіть у `/3ds/`.
+1. Завантажте CIA з [релізу Yu](https://github.com/Yu08083/3ds-recorder/releases/tag/v1.5.0-yu.y01).
+2. Скопіюйте CIA на SD-картку й встановіть через FBI (SD → файл → **Install CIA**) або відкрийте у FBI **Remote Install** → **Scan QR Code** і відскануйте QR-код із релізу.
 3. Увімкніть консоль із затиснутою **SELECT**. У меню Luma увімкніть **Enable loading external FIRMs and modules**
    і збережіть кнопкою **START**.
 4. Відкрийте **3DS Recorder**, виберіть мову і прочитайте короткий гайд. Рекордер запуститься сам: LED на мить

@@ -1,5 +1,6 @@
 #include "recorder.h"
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +10,7 @@
 
 #include "../../sysmod/source/shared.h"
 #include "../../sysmod/source/autostart.h"
+#include "../../sysmod/source/launcher_order.h"
 #include "shared_addr.h"
 
 Result svcControlService(u32 op, ...);
@@ -118,7 +120,7 @@ static Handle OpenModule(void)
     s32 n = 0;
     if (R_FAILED(svcGetProcessList(&n, pids, 64)))
         return 0;
-    for (s32 i = 0; i < n; i++) {
+    for (s32 i = 0; i < n && i < 64; i++) {
         Handle h = 0;
         if (R_FAILED(svcOpenProcess(&h, pids[i])))
             continue;
@@ -126,7 +128,9 @@ static Handle OpenModule(void)
         s64 raw = 0;
         if (R_SUCCEEDED(svcGetProcessInfo(&raw, h, 0x10000)))
             memcpy(name, &raw, 8);
-        if (strcmp(name, REC_PROCESS_NAME) == 0)
+        s64 title = 0;
+        if (strcmp(name, REC_PROCESS_NAME) == 0 &&
+            R_SUCCEEDED(svcGetProcessInfo(&title, h, 0x10001)) && (u64)title == REC_TITLE_ID)
             return h;
         svcCloseHandle(h);
     }
@@ -147,12 +151,21 @@ static bool ModuleRunning(void)
    module, O3DS 2026-11-16): its writable pages are searched for the page once. */
 static u32 g_sharedVa = REC_SHARED_VA;
 
+static bool ValidShared(const volatile RecShared *s)
+{
+    if (s->magic != REC_SHARED_MAGIC || s->version == 0 || s->version > REC_SHARED_VERSION)
+        return false;
+    if (s->version == REC_SHARED_VERSION && s->buildTag != REC_BUILD_TAG)
+        return false;
+    return s->state <= REC_STATE_REPLAY && s->cmd <= REC_CMD_SAVE_CLIP;
+}
+
 static bool MapPage(Handle module, u32 va)
 {
     if (R_FAILED(svcMapProcessMemoryEx(CUR_PROCESS_HANDLE, MAP_VA, module, va, 0x1000, 0)))
         return false;
     const volatile RecShared *s = (const volatile RecShared *)MAP_VA;
-    if (s->magic == REC_SHARED_MAGIC && s->version >= 1u && s->version <= 64u)
+    if (ValidShared(s))
         return true;
     svcUnmapProcessMemoryEx(CUR_PROCESS_HANDLE, MAP_VA, 0x1000);
     return false;
@@ -166,15 +179,19 @@ static bool FindShared(Handle module)
         PageInfo pi;
         if (R_FAILED(svcQueryProcessMemory(&mi, &pi, module, va)) || mi.size == 0)
             return false;
+        const u64 end = (u64)mi.base_addr + mi.size;
+        const u32 next = end < 0x04000000u ? (u32)end : 0x04000000u;
+        if (next <= va)
+            return false;
         if ((mi.perm & MEMPERM_READWRITE) == MEMPERM_READWRITE && mi.state != MEMSTATE_FREE)
-            for (u32 p = mi.base_addr; p < mi.base_addr + mi.size; p += 0x1000)
+            for (u32 p = va; p < next; p += 0x1000)
                 if (MapPage(module, p)) {
                     app_log("module: shared page at %08lX (this app's module has it at %08lX)", (unsigned long)p,
                             (unsigned long)REC_SHARED_VA);
                     g_sharedVa = p;
                     return true;
                 }
-        va = mi.base_addr + mi.size;
+        va = next;
     }
     return false;
 }
@@ -187,8 +204,11 @@ static volatile RecShared *MapShared(Handle module)
     LightLock_Lock(&g_mapLock);
     MemInfo mi;
     PageInfo pi;
-    if (R_FAILED(svcQueryMemory(&mi, &pi, MAP_VA)) || mi.state != MEMSTATE_FREE ||
-        (!MapPage(module, g_sharedVa) && !FindShared(module))) {
+    const bool free = R_SUCCEEDED(svcQueryMemory(&mi, &pi, MAP_VA)) && mi.state == MEMSTATE_FREE;
+    const bool cached = free && R_SUCCEEDED(svcQueryProcessMemory(&mi, &pi, module, g_sharedVa)) &&
+                        (mi.perm & MEMPERM_READWRITE) == MEMPERM_READWRITE && mi.state != MEMSTATE_FREE &&
+                        MapPage(module, g_sharedVa);
+    if (!cached && (!free || !FindShared(module))) {
         LightLock_Unlock(&g_mapLock);
         return NULL;
     }
@@ -254,6 +274,7 @@ static void Status(RecStatus *out, bool beat)
     volatile RecShared *s = MapShared(m);
     if (s) {
         out->readable = true;
+        out->currentBuild = s->version == REC_SHARED_VERSION;
         out->state = s->state;
         out->recSeconds = s->recSeconds;
         out->recKb = s->recKb;
@@ -262,7 +283,7 @@ static void Status(RecStatus *out, bool beat)
         out->dropped = s->dropped;
         out->files = s->files;
         out->lastError = s->lastError;
-        snprintf(out->lastFile, sizeof(out->lastFile), "%s", (const char *)s->lastFile);
+        snprintf(out->lastFile, sizeof(out->lastFile), "%.47s", (const char *)s->lastFile);
         if (s->version >= 3) { /* an older module has no replay buffer */
             out->replayOn = s->replayOn != 0;
             out->replayError = s->replayError;
@@ -314,24 +335,17 @@ static Result LaunchFn(void *arg)
     return PMAPP_LaunchTitle(&info, 0);
 }
 
-static Result TerminateFn(void *arg)
-{
-    (void)arg;
-    return PMAPP_TerminateTitle(REC_TITLE_ID, 3ull * 1000 * 1000 * 1000);
-}
-
 bool recorder_stop(void)
 {
     if (!ModuleRunning())
         return true;
-    recorder_command(REC_CMD_EXIT);
+    if (!recorder_command(REC_CMD_EXIT))
+        return false;
     for (int i = 0; i < 150; i++) { /* up to 15 s: a recording is saved first */
         svcSleepThread(100 * 1000 * 1000);
         if (!ModuleRunning())
             return true;
     }
-    WithPmApp(TerminateFn, NULL);
-    svcSleepThread(500 * 1000 * 1000);
     return !ModuleRunning();
 }
 
@@ -347,81 +361,198 @@ static bool FileExists(const char *path)
 }
 
 /* romfs copy vs SD copy of a file the app installs */
-static ModuleFile CompareFile(const char *romfsPath, const char *sdPath)
+static ModuleFile CompareFile(const char *source, const char *path)
 {
-    FILE *a = fopen(romfsPath, "rb");
+    FILE *a = fopen(source, "rb");
+    if (!a)
+        return MODULE_UNREADABLE;
     char full[160];
-    snprintf(full, sizeof(full), "sdmc:%s", sdPath);
+    snprintf(full, sizeof(full), "sdmc:%s", path);
     FILE *b = fopen(full, "rb");
-    ModuleFile st = b ? MODULE_DIFFERENT : MODULE_MISSING;
-    /* heap buffers: the info thread and the action worker can both compare */
-    u8 *ba = a && b ? malloc(16384) : NULL, *bb = ba ? malloc(16384) : NULL;
-    if (ba && bb) {
-        st = MODULE_SAME;
+    ModuleFile result = b || errno != ENOENT ? MODULE_UNREADABLE : MODULE_MISSING;
+    const size_t chunk = 8192;
+    u8 *bytes = b ? malloc(2 * chunk) : NULL;
+    if (bytes) {
+        bool any = false;
         for (;;) {
-            const size_t na = fread(ba, 1, 16384, a), nb = fread(bb, 1, 16384, b);
-            if (na != nb || memcmp(ba, bb, na) != 0) {
-                st = MODULE_DIFFERENT;
+            const size_t na = fread(bytes, 1, chunk, a);
+            const size_t nb = fread(bytes + chunk, 1, chunk, b);
+            if (ferror(a) || ferror(b))
+                break;
+            if (na != nb || memcmp(bytes, bytes + chunk, na)) {
+                result = MODULE_DIFFERENT;
                 break;
             }
-            if (na == 0)
+            any |= na != 0;
+            if (na < chunk) {
+                if (any && feof(a) && feof(b))
+                    result = MODULE_SAME;
                 break;
+            }
         }
     }
-    free(ba);
-    free(bb);
-    if (a)
-        fclose(a);
-    if (b)
-        fclose(b);
-    return st;
+    free(bytes);
+    if (fclose(a) != 0)
+        result = MODULE_UNREADABLE;
+    if (b && fclose(b) != 0)
+        result = MODULE_UNREADABLE;
+    return result;
 }
 
-static bool CopyFile(const char *romfsPath, const char *sdPath)
+typedef struct {
+    const char *source, *live, *staged, *backup;
+} InstallFile;
+
+static const InstallFile installFiles[] = {
+    {"romfs:/rec3ds.cxi", REC_CXI_FS, REC_CXI_FS ".yu-new", REC_CXI_FS ".yu-old"},
+    {"romfs:/rec3ds-launch.3gx", REC_LAUNCH_FS, REC_LAUNCH_FS ".yu-new", REC_LAUNCH_FS ".yu-old"}
+};
+
+static int FilePresent(const char *path)
 {
+    Handle f;
+    Result rc = FSUSER_OpenFile(&f, g_sd, fsMakePath(PATH_ASCII, path), FS_OPEN_READ, 0);
+    if (R_FAILED(rc))
+        return R_SUMMARY(rc) == RS_NOTFOUND ? 0 : -1;
+    return R_SUCCEEDED(FSFILE_Close(f)) ? 1 : -1;
+}
+
+static bool RemoveOwned(const char *path)
+{
+    Result rc = FSUSER_DeleteFile(g_sd, fsMakePath(PATH_ASCII, path));
+    return R_SUCCEEDED(rc) || R_SUMMARY(rc) == RS_NOTFOUND;
+}
+
+static bool MoveOwned(const char *from, const char *to)
+{
+    return R_SUCCEEDED(FSUSER_RenameFile(g_sd, fsMakePath(PATH_ASCII, from), g_sd, fsMakePath(PATH_ASCII, to)));
+}
+
+static bool StageFile(const InstallFile *file)
+{
+    FILE *in = fopen(file->source, "rb");
+    if (!in)
+        return false;
     char full[160];
-    snprintf(full, sizeof(full), "sdmc:%s", sdPath);
-    FILE *in = fopen(romfsPath, "rb");
+    snprintf(full, sizeof(full), "sdmc:%s", file->staged);
     FILE *out = fopen(full, "wb");
-    bool ok = in && out;
     static u8 buf[16384];
+    bool ok = out != NULL;
     while (ok) {
         const size_t n = fread(buf, 1, sizeof(buf), in);
-        if (!n)
+        ok = !ferror(in) && fwrite(buf, 1, n, out) == n;
+        if (n < sizeof(buf)) {
+            ok = ok && feof(in);
             break;
-        ok = fwrite(buf, 1, n, out) == n;
+        }
     }
-    if (in)
-        fclose(in);
-    if (out)
-        fclose(out);
-    if (!ok)
-        FSUSER_DeleteFile(g_sd, fsMakePath(PATH_ASCII, sdPath));
-    return ok;
+    if (fclose(in) != 0)
+        ok = false;
+    if (out) {
+        if (fflush(out) != 0)
+            ok = false;
+        if (fclose(out) != 0)
+            ok = false;
+    }
+    return ok && CompareFile(file->source, file->staged) == MODULE_SAME;
 }
 
 ModuleFile recorder_module_file(void)
 {
-    return CompareFile("romfs:/rec3ds.cxi", REC_CXI_FS);
+    ModuleFile module = CompareFile(installFiles[0].source, installFiles[0].live);
+    return module == MODULE_SAME ? CompareFile(installFiles[1].source, installFiles[1].live) : module;
 }
 
-static bool InstallModule(void)
+static bool PrepareInstall(void)
 {
     FSUSER_CreateDirectory(g_sd, fsMakePath(PATH_ASCII, "/luma"), 0);
     FSUSER_CreateDirectory(g_sd, fsMakePath(PATH_ASCII, "/luma/sysmodules"), 0);
-    return CopyFile("romfs:/rec3ds.cxi", REC_CXI_FS);
-}
-
-/* The launcher plugin the module hands to Rosalina when an extended-memory game reboots an Old
-   3DS (sysmod: WriteGameOrder). It lies in the app's own folder, never in /luma/plugins. */
-static void InstallLauncher(void)
-{
-    if (CompareFile("romfs:/rec3ds-launch.3gx", REC_LAUNCH_FS) == MODULE_SAME)
-        return;
     FSUSER_CreateDirectory(g_sd, fsMakePath(PATH_ASCII, "/3ds"), 0);
     FSUSER_CreateDirectory(g_sd, fsMakePath(PATH_ASCII, REC_DIR_FS), 0);
-    app_log("start: installing the launcher plugin: %s",
-            CopyFile("romfs:/rec3ds-launch.3gx", REC_LAUNCH_FS) ? "ok" : "failed");
+    bool checked = false;
+    ModuleFile current = MODULE_UNREADABLE;
+    for (size_t i = 0; i < sizeof(installFiles) / sizeof(*installFiles); ++i) {
+        const InstallFile *file = &installFiles[i];
+        const int backup = FilePresent(file->backup);
+        if (backup < 0 || !RemoveOwned(file->staged))
+            return false;
+        if (backup) {
+            if (!checked) {
+                current = recorder_module_file();
+                if (current == MODULE_UNREADABLE)
+                    return false;
+                checked = true;
+            }
+            if (current == MODULE_SAME) {
+                if (!RemoveOwned(file->backup))
+                    return false;
+            } else {
+                const int present = FilePresent(file->live);
+                if (present < 0 || (present && !MoveOwned(file->live, file->staged)))
+                    return false;
+                if (!MoveOwned(file->backup, file->live)) {
+                    if (present)
+                        MoveOwned(file->staged, file->live);
+                    return false;
+                }
+                if (present && !RemoveOwned(file->staged))
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool InstallFiles(const char **step)
+{
+    enum { count = sizeof(installFiles) / sizeof(*installFiles) };
+    ModuleFile before[count];
+    bool saved[count] = {0}, published[count] = {0};
+    *step = "SD";
+    if (!PrepareInstall())
+        return false;
+    for (size_t i = 0; i < count; ++i) {
+        const InstallFile *f = &installFiles[i];
+        before[i] = CompareFile(f->source, f->live);
+        if (before[i] == MODULE_UNREADABLE ||
+            (before[i] != MODULE_SAME && !StageFile(f)))
+            return false;
+    }
+    RecStatus status;
+    recorder_status(&status);
+    if (status.running && (!status.currentBuild || before[0] != MODULE_SAME)) {
+        *step = "stop";
+        if (!status.readable || (status.state != REC_STATE_IDLE && status.state != REC_STATE_REPLAY &&
+                                 status.state != REC_STATE_ERROR) || !recorder_stop())
+            return false;
+    }
+    *step = "SD";
+    for (size_t i = 0; i < count; ++i) {
+        if (before[i] == MODULE_SAME)
+            continue;
+        const InstallFile *f = &installFiles[i];
+        if (before[i] == MODULE_DIFFERENT && !(saved[i] = MoveOwned(f->live, f->backup)))
+            goto rollback;
+        if (!(published[i] = MoveOwned(f->staged, f->live)))
+            goto rollback;
+    }
+    for (size_t i = 0; i < count; ++i)
+        if (published[i] && CompareFile(installFiles[i].source, installFiles[i].live) != MODULE_SAME)
+            goto rollback;
+    for (size_t i = 0; i < count; ++i)
+        if (saved[i] && !RemoveOwned(installFiles[i].backup))
+            return false;
+    return true;
+
+rollback:
+    for (size_t i = count; i-- > 0;) {
+        const InstallFile *f = &installFiles[i];
+        if (published[i] && !RemoveOwned(f->live))
+            continue;
+        if (saved[i])
+            MoveOwned(f->backup, f->live);
+    }
+    return false;
 }
 
 bool recorder_luma_modules_on(void)
@@ -452,18 +583,8 @@ Result recorder_install_and_start(const char **step)
 {
     *step = "";
     app_log("start: checking the module file");
-    InstallLauncher();
-    if (recorder_module_file() != MODULE_SAME) {
-        app_log("start: installing the module");
-        if (ModuleRunning() && !recorder_stop()) {
-            *step = "stop";
-            return -1;
-        }
-        if (!InstallModule()) {
-            *step = "install";
-            return -2;
-        }
-    }
+    if (!InstallFiles(step))
+        return -2;
     if (ModuleRunning())
         return 0;
     if (!recorder_luma_modules_on()) {
@@ -520,10 +641,11 @@ static void RemoveLauncherOrder(void)
     FILE *f = fopen("sdmc:/luma/plugins/user_param.bin", "rb");
     if (!f)
         return;
-    char buf[400] = {0};
-    const size_t n = fread(buf, 1, sizeof(buf), f);
+    RecorderLauncherOrder saved;
+    const bool own = fread(&saved, 1, sizeof(saved), f) == sizeof(saved) &&
+                     fgetc(f) == EOF && !ferror(f) && RecorderOwnsOrder(&saved);
     fclose(f);
-    if (n > 8 + strlen(REC_LAUNCH_FS) && strcmp(buf + 12, REC_LAUNCH_FS) == 0) /* magic, 4 flag bytes, title id, path */
+    if (own)
         FSUSER_DeleteFile(g_sd, fsMakePath(PATH_ASCII, order));
 }
 
@@ -571,7 +693,8 @@ static void RemoveAutostart(void)
 
 bool recorder_uninstall(bool recordings, const char *selfPath)
 {
-    recorder_stop();
+    if (!recorder_stop())
+        return false;
     RemoveAutostart();
     RemoveLauncherOrder();
     FSUSER_DeleteFile(g_sd, fsMakePath(PATH_ASCII, REC_CXI_FS));
@@ -581,7 +704,9 @@ bool recorder_uninstall(bool recordings, const char *selfPath)
     LightLock_Unlock(&g_logLock);
     static const char *const files[] = {REC_DIR_FS "/recorder.log", REC_DIR_FS "/recorder.old.log", REC_DIR_FS "/.system_stop",
                                         REC_DIR_FS "/app.log", REC_DIR_FS "/app.old.log", REC_DIR_FS "/stats.ini",
-                                        REC_LAUNCH_FS, REC_DIR_FS "/.plugin_loader_on",
+                                        REC_LAUNCH_FS, REC_DIR_FS "/.plugin_loader_on", REC_DIR_FS "/.launcher-order.tmp",
+                                        REC_LAUNCH_FS ".yu-old", REC_LAUNCH_FS ".yu-new",
+                                        REC_CXI_FS ".yu-old", REC_CXI_FS ".yu-new",
                                         REC_DIR_FS "/.autostart", REC_DIR_FS "/.boot_try", REC_DIR_FS "/.autostart_failed",
                                         REC_DIR_FS "/no_launcher.txt", REC_DIR_FS "/.launcher_try",
                                         REC_FILES_FS "/.next.tmp", REC_FILES_FS "/.next.info",

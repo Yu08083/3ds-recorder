@@ -55,3 +55,4 @@ tests/host/test_i18n
 tests/host/test_appletguard
 tests/host/test_join
 tests/host/test_stats
+/app/romfs/licenses/

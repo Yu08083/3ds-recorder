@@ -8,6 +8,8 @@ TESTS   := test_bench test_convert test_codec test_audio test_huff test_fused te
 test: $(TESTS)
 	@for t in $(TESTS); do ./$$t || exit 1; done
 	@python3 recorder_coexist.py
+	@python3 recorder_upgrade.py
+	@python3 recorder_display.py
 
 test_bench: test_bench.c ../../libbench/source/bench.c ../../libbench/include/bench.h
 	$(CC) $(CFLAGS) -o $@ test_bench.c ../../libbench/source/bench.c -lm
