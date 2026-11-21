@@ -1,0 +1,57 @@
+name: Build Yu Recorder
+on:
+  push:
+    branches: ['yu/recorder-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cia:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkitarm@sha256:15b79ce75822c289538d8153da5fa7aafe5e6adc32ad8a575a197beca0f0761b
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Yu08083/Luma3DS-13.4Y
+          ref: 3301acbae1c756638fcabc42e0959963c5cb8929
+          path: build/tool-source
+          persist-credentials: false
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends g++ cmake python3 git make
+      - name: Host tests
+        run: make -C tests/host -j2 test
+      - name: Build Recorder CIA
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path('build/tool-source/tools').resolve()))
+          from recorder import build_tools
+          scratch = Path('/tmp/yu-recorder-tools')
+          scratch.mkdir()
+          env = build_tools(scratch, 2)
+          for folder,target in [('sysmod','all'),('plugin','all'),('app','cia')]:
+              subprocess.run(['make','-j2',target], cwd=folder, check=True, env=env)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: yu-recorder
+          path: |
+            app/3ds-recorder.cia
+            app/3ds-recorder.3dsx
+            app/3ds-recorder.elf
+            sysmod/rec3ds.cxi
+            sysmod/rec3ds.elf
+            plugin/rec3ds-launch.3gx
+          if-no-files-found: error

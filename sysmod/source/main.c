@@ -487,7 +487,8 @@ static bool g_powerOffNow;   /* (defined again below) ptm is powering the consol
 static bool g_shutdownSeen;  /* (defined again below) the system ends the recorder */
 static u32  g_ledPtmFails;   /* ptm:sysm refused this many LED writes running */
 
-static void LedWrite(const InfoLedPattern *p)
+_Static_assert(sizeof(MCU_InfoLedPattern) == 100, "LED IPC payload size");
+static void LedWrite(const MCU_InfoLedPattern *p)
 {
     u32 cmd[26];
     if (g_powerOffNow)   /* ptm is busy powering off, and the power-off clears the LED itself */
@@ -525,11 +526,11 @@ static void LedWrite(const InfoLedPattern *p)
 
 static void LedPattern(const u8 *r, const u8 *g, const u8 *b, u8 delay, u8 smoothing, u8 loopDelay)
 {
-    InfoLedPattern p;
+    MCU_InfoLedPattern p;
     memset(&p, 0, sizeof(p));
-    p.delay = delay;
-    p.smoothing = smoothing;
-    p.loopDelay = loopDelay;
+    p.animation.ticksPerFrame = delay;
+    p.animation.frameTransitionDelay = smoothing;
+    p.animation.numLastFrameRepeats = loopDelay;
     memcpy(p.redPattern, r, 32);
     memcpy(p.greenPattern, g, 32);
     memcpy(p.bluePattern, b, 32);
