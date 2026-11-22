@@ -6,6 +6,10 @@ SRC  := host_prep.c $(ROOT)/prep/source/prep.c $(wildcard $(ROOT)/codec/source/*
 INC  := -I$(ROOT)/prep/include -I$(ROOT)/codec/include -I$(ROOT)/tools/r3dconv -I$(ROOT)/third_party/minih264 \
         -I$(AAC)/aacenc/inc -I$(AAC)/aacenc/basic_op -I$(AAC)/common/include
 
-$(ROOT)/build/host_prep: $(SRC) $(ROOT)/prep/include/prep.h
+$(ROOT)/build/host_prep: ENCODER_SRC = $(SRC)
+$(ROOT)/build/host_prep_padded: ENCODER_SRC = $(subst $(ROOT)/prep/source/prep.c,padded_reference.c,$(SRC))
+$(ROOT)/build/host_prep $(ROOT)/build/host_prep_padded: $(SRC) $(ROOT)/prep/include/prep.h
 	@mkdir -p $(@D)
-	$(CC) $(CPPFLAGS) -O2 -w $(INC) $(SRC) -lm -lpthread -o $@
+	$(CC) $(CPPFLAGS) -O2 -w $(INC) $(ENCODER_SRC) -lm -lpthread -o $@
+
+$(ROOT)/build/host_prep_padded: padded_reference.c

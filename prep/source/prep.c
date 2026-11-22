@@ -405,7 +405,7 @@ static int aac_open(PrepJob *j)
     p.bitRate = (j->opt.audioKbps ? j->opt.audioKbps : 96) * 1000;
     p.nChannels = 2;
     p.adtsUsed = 0;
-    if (j->aapi.SetParam(j->ah, VO_PID_AAC_ENCPARAM, &p) != VO_ERR_NONE)
+    if (j->aapi.SetParam(j->ah, VO_PID_AAC_MP4_ENCPARAM, &p) != VO_ERR_NONE)
         return fail(j, "AAC encoder settings refused");
     return 0;
 }
@@ -1256,10 +1256,22 @@ static int write_moov(PrepJob *j)
         const size_t mp4a = box(&b, "mp4a");
         b_zero(&b, 6), b_u16(&b, 1), b_zero(&b, 8), b_u16(&b, 2), b_u16(&b, 16), b_u32(&b, 0), b_u32(&b, OUT_RATE << 16);
         const size_t esds = fullbox(&b, "esds", 0);
-        const uint32_t br = (j->opt.audioKbps ? j->opt.audioKbps : 96) * 1000;
+        const uint32_t samplesPerSecond = (OUT_RATE + AAC_FRAME - 1) / AAC_FRAME;
+        uint64_t audioBytes = 0;
+        uint32_t windowBytes = 0, peakBytes = 0;
+        for (uint32_t i = 0; i < na; i++) {
+            audioBytes += a[i][1];
+            windowBytes += a[i][1];
+            if (i >= samplesPerSecond)
+                windowBytes -= a[i - samplesPerSecond][1];
+            if (windowBytes > peakBytes)
+                peakBytes = windowBytes;
+        }
+        const uint32_t averageBps = (uint32_t)(audioBytes * 8 * OUT_RATE / ((uint64_t)na * AAC_FRAME));
+        const uint32_t maximumBps = peakBytes * 8 > averageBps ? peakBytes * 8 : averageBps;
         b_u8(&b, 3), b_u8(&b, 25), b_u16(&b, 2), b_u8(&b, 0);              /* ES_Descriptor */
         b_u8(&b, 4), b_u8(&b, 17), b_u8(&b, 0x40), b_u8(&b, 0x15);         /* DecoderConfig: AAC, audio */
-        b_u8(&b, 0), b_u16(&b, AAC_OUT_MAX), b_u32(&b, br), b_u32(&b, br);
+        b_u8(&b, 0), b_u16(&b, AAC_OUT_MAX), b_u32(&b, maximumBps), b_u32(&b, averageBps);
         b_u8(&b, 5), b_u8(&b, 2), b_u8(&b, 0x12), b_u8(&b, 0x90);          /* AAC-LC, 32 kHz, stereo */
         b_u8(&b, 6), b_u8(&b, 1), b_u8(&b, 2);                             /* SLConfig */
         box_end(&b, esds);
