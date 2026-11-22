@@ -25,9 +25,14 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update -qq
-          apt-get install -y --no-install-recommends g++ cmake python3 git make
+          apt-get install -y --no-install-recommends g++ cmake python3 git make ffmpeg
       - name: Host tests
         run: make -C tests/host -j2 test
+      - name: Verify MP4 frame timing and AAC output
+        run: |
+          make -C tests/prep -j2 ../../build/host_prep ../../build/host_prep_padded
+          python3 tests/prep/held_frames.py build/host_prep
+          python3 tests/prep/aac_fill.py build/host_prep build/host_prep_padded
       - name: Build Recorder CIA
         shell: bash
         run: |
