@@ -1,9 +1,10 @@
 /*
  * Runs prep/ (the console's "prepare for the phone") on a PC: the producer and the writer on
  * their own threads, the consumer here, as the app does.
- * Usage: host_prep <file.r3d> <out base> [--interrupt N] [--threads N]
+ * Usage: host_prep <file.r3d> <out base> [--interrupt N] [--threads N] [--resume-at-permille N]
  *   --interrupt N: abort and reopen the job every N consumer calls (resume test)
  *   --threads N:   H.264 in N slices at once (PrepOptions.threads; the New 3DS app uses 2)
+ *   --resume-at-permille N: interrupt once after the saved checkpoint reaches N thousandths
  */
 #include <pthread.h>
 #include <stdio.h>
@@ -65,15 +66,17 @@ static void *writer(void *job)
 int main(int argc, char **argv)
 {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <file.r3d> <out base> [--interrupt N] [--threads N]\n", argv[0]);
+        fprintf(stderr, "usage: %s <file.r3d> <out base> [--interrupt N] [--threads N] [--resume-at-permille N]\n", argv[0]);
         return 2;
     }
-    int every = 0, threads = 1;
+    int every = 0, threads = 1, resumeAt = 0;
     for (int i = 3; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--interrupt"))
             every = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--threads"))
             threads = atoi(argv[i + 1]);
+        else if (!strcmp(argv[i], "--resume-at-permille"))
+            resumeAt = atoi(argv[i + 1]);
     }
     PrepOptions o = {0, 0, now_us, sleep_us, threads, run_jobs, NULL};
     char err[128];
@@ -97,6 +100,8 @@ int main(int argc, char **argv)
             if (r == PREP_WAIT)
                 usleep(500);
             if (r == PREP_DONE || r == PREP_ERROR || (every && ++calls >= every))
+                break;
+            if (resumeAt && opens == 1 && prep_saved_permille(argv[2]) >= resumeAt)
                 break;
         }
         prep_abort(j);

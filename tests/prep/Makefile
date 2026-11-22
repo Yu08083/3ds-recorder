@@ -7,4 +7,5 @@ INC  := -I$(ROOT)/prep/include -I$(ROOT)/codec/include -I$(ROOT)/tools/r3dconv -
         -I$(AAC)/aacenc/inc -I$(AAC)/aacenc/basic_op -I$(AAC)/common/include
 
 $(ROOT)/build/host_prep: $(SRC) $(ROOT)/prep/include/prep.h
-	$(CC) -O2 -DPREP_PLAIN_C -w $(INC) $(SRC) -lm -lpthread -o $@
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -O2 -w $(INC) $(SRC) -lm -lpthread -o $@

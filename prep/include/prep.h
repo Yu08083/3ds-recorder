@@ -8,9 +8,8 @@
  * One pass over the recording, the way tools/r3dconv reads it (no --repair): frames are
  * composed into the 400 x 480 (or 400 x 240, top only) picture r3dconv makes; a video frame
  * goes out when a screen changed, at the time the recorder captured it (a clock in ms, variable
- * frame rate: a still picture costs nothing; see GRID_HZ in prep.c). Audio goes the
- * player's way (audio_place + audio_conceal + EQ), is resampled to 32 kHz and encoded to
- * AAC-LC.
+ * frame rate). A picture held for at least 400 ms is encoded once at the highest configured
+ * quality. Audio follows the player's audio_place, audio_conceal and EQ path into 32 kHz AAC-LC.
  *
  * Two halves, for two threads (two cores on the console):
  *   prep_produce  reads the recording, decodes the screens, makes each video frame's YUV
@@ -24,9 +23,8 @@
  *   base.mp4.part   ftyp + mdat being written
  *   base.ptbl       sample table so far (12 bytes per sample)
  *   base.prep       resume points: two slots, the newer valid one wins
- * A resume point is taken before every key frame (every PREP_GOP video frames), with the
- * queue empty, so a job that is stopped, crashes or loses power goes on from there and loses
- * at most one GOP.
+ * The producer saves a resume point every PREP_GOP pictures and periodically when display frames
+ * repeat. The queue is drained before saving. The first picture after a restart is a key frame.
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -35,7 +33,7 @@
 extern "C" {
 #endif
 
-#define PREP_GOP 120   /* key frame every 120 video frames (4 s at 30 fps) */
+#define PREP_GOP 120   /* maximum key frame interval in encoded pictures */
 
 typedef struct {
     int videoKbps;           /* 0: PREP_VIDEO_KBPS (prep.c) */

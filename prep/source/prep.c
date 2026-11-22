@@ -10,6 +10,7 @@
 #include "prep.h"
 
 #include <math.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <sys/types.h>
 #include <stdlib.h>
@@ -51,6 +52,7 @@
  * refresh pair share a picture (one video frame for the two, as before).
  */
 #define GRID_HZ 1000u
+#define STILL_TICKS (GRID_HZ * 2 / 5)
 #define COALESCE_MS(fps) (600u / (uint32_t)(fps))   /* 20 ms at 30 frames a second */
 #define TOP_N (400 * 240)
 #define BOT_N (320 * 240)
@@ -101,7 +103,7 @@ typedef struct {
    recorder's own codec: 345 KB of pixels are ~100-200 KB, and the SD card writes slowly) */
 #define SLOT_BYTES ((sizeof(State) + 8 + codec_xr32_max_size(TOP_N) + codec_xr32_max_size(BOT_N) + 4095) & ~(size_t)4095)
 
-enum { IT_PIC, IT_AAC, IT_END };
+enum { IT_PIC, IT_STILL, IT_AAC, IT_END };
 typedef struct {
     uint8_t type;
     uint8_t slot;       /* IT_PIC: picture buffer */
@@ -121,6 +123,9 @@ struct PrepJob {
     uint32_t endUs, haveEnd;
     State s;
     /* producer */
+    int lastPic;
+    bool pendingPic;
+    uint64_t pictureTick, checkpointTick;
     uint16_t *px[2];
     uint8_t *payload, *yuv;             /* yuv: the picture as it is now (updated a screen at a time) */
     VO_AUDIO_CODECAPI aapi;
@@ -637,29 +642,54 @@ int prep_saved_permille(const char *base)
 
 /* ------------------------------------------------------------------ [P] video */
 
+static int submit_picture(PrepJob *j, uint64_t until)
+{
+    if (!j->pendingPic)
+        return 0;
+    const bool held = until >= j->pictureTick + STILL_TICKS;
+    const Item it = {held ? IT_STILL : IT_PIC, (uint8_t)j->lastPic, 0, j->pictureTick, NULL};
+    if (push(j, &it))
+        return PREP_ERROR;
+    j->pendingPic = false;
+    j->s.videoFrames++;
+    return 0;
+}
+
 /* The picture as it is now becomes the video frame of grid tick `tick`. */
 static int produce_picture(PrepJob *j, uint64_t tick, uint64_t recStart)
 {
     State *s = &j->s;
-    if (s->videoFrames % PREP_GOP == 0 && s->videoFrames && !j->skipCk)
-        if (wait_drained(j) || checkpoint(j, recStart))
-            return PREP_ERROR;
-    j->skipCk = 0;
     const uint64_t t0 = now_us(j);
     for (int sc = 0; sc < 2; sc++)
         if (s->dirty & (1u << sc) && SCREEN_SHOWN(j, sc))
             yuv_screen(j, sc);
-    s->dirty = 0;
+    const size_t bytes = 400 * (size_t)j->H * 3 / 2;
+    const bool repeated = j->lastPic >= 0 && memcmp(j->pic[j->lastPic], j->yuv, bytes) == 0;
     j->st.yuvMs += ms_since(j, t0);
+    if (!repeated && submit_picture(j, tick))
+        return PREP_ERROR;
+    /* A resume point describes either an already held picture or a change still to queue. */
+    if (repeated)
+        s->dirty = 0;
+    const bool savePoint = repeated ? tick >= j->checkpointTick + PREP_GOP * GRID_HZ / j->fps :
+                                     s->videoFrames && s->videoFrames % PREP_GOP == 0;
+    if (savePoint && !j->skipCk && !j->pendingPic) {
+        if (wait_drained(j) || checkpoint(j, recStart))
+            return PREP_ERROR;
+        j->checkpointTick = tick;
+    }
+    j->skipCk = 0;
+    if (repeated)
+        return 0;
+    s->dirty = 0;
     const int slot = free_slot(j);
     if (slot < 0)
         return PREP_ERROR;
-    memcpy(j->pic[slot], j->yuv, 400 * (size_t)j->H * 3 / 2);
+    memcpy(j->pic[slot], j->yuv, bytes);
     STORE(j->picBusy[slot], 1);
-    const Item it = {IT_PIC, (uint8_t)slot, 0, tick, NULL};
-    if (push(j, &it))
-        return PREP_ERROR;
-    s->videoFrames++;
+    j->lastPic = slot;
+    j->pictureTick = tick;
+    j->pendingPic = true;
     return 0;
 }
 
@@ -669,6 +699,9 @@ static int video_until(PrepJob *j, uint32_t timeUs, uint64_t recStart)
     State *s = &j->s;
     while (s->emitted * (1000000ull / GRID_HZ) < timeUs) {
         if (s->dirty && s->emitted >= s->dirtySince + COALESCE_MS(j->fps) && produce_picture(j, s->dirtySince, recStart))
+            return PREP_ERROR;
+        if (!s->dirty && j->pendingPic && s->emitted >= j->pictureTick + STILL_TICKS
+            && submit_picture(j, s->emitted))
             return PREP_ERROR;
         s->emitted++;
     }
@@ -681,7 +714,9 @@ static int produce_end(PrepJob *j)
     State *s = &j->s;
     if (!j->haveEnd)
         j->endUs = s->lastUs;
-    if (video_until(j, j->endUs, s->srcOffset) || (s->dirty && produce_picture(j, s->dirtySince, s->srcOffset)))
+    const uint64_t endTick = ((uint64_t)j->endUs * GRID_HZ + 999999) / 1000000;
+    if (video_until(j, j->endUs, s->srcOffset) || (s->dirty && produce_picture(j, s->dirtySince, s->srcOffset))
+        || submit_picture(j, endTick))
         return PREP_ERROR;
     if (j->audio) {
         if (audio_push(j, NULL, (uint32_t)audio_pad_to(&s->ap, j->endUs)))
@@ -692,7 +727,7 @@ static int produce_end(PrepJob *j)
             if (aac_emit(j, 0.f, 0.f))
                 return PREP_ERROR;
     }
-    const Item it = {IT_END, 0, 0, ((uint64_t)j->endUs * GRID_HZ + 999999) / 1000000, NULL};
+    const Item it = {IT_END, 0, 0, endTick, NULL};
     if (push(j, &it))
         return PREP_ERROR;
     j->producerDone = 1;
@@ -935,7 +970,12 @@ static int consume_picture(PrepJob *j, const Item *it)
     unsigned char *coded = NULL;
     int size = 0;
     const uint64_t t0 = now_us(j);
-    const int bad = H264E_encode(j->enc, j->scratch, &j->run, &io, &coded, &size);
+    H264E_run_param_t run = j->run;
+    if (it->type == IT_STILL) {
+        run.qp_max = run.qp_min;
+        run.frame_type = H264E_FRAME_TYPE_KEY;
+    }
+    const int bad = H264E_encode(j->enc, j->scratch, &run, &io, &coded, &size);
     STORE(j->picBusy[it->slot], 0);
     j->st.videoMs += ms_since(j, t0);
     if (bad || size <= 0)
@@ -1306,7 +1346,7 @@ int prep_consume(PrepJob *j)
         Item it = j->ring[t % RING];
         STORE(j->tail, t + 1);
         int r = 0;
-        if (it.type == IT_PIC)
+        if (it.type == IT_PIC || it.type == IT_STILL)
             r = consume_picture(j, &it);
         else if (it.type == IT_AAC)
             r = consume_audio(j, &it);
@@ -1414,6 +1454,7 @@ PrepJob *prep_open(const char *src, const char *base, const PrepOptions *opt, ch
         return NULL;
     }
     j->opt = *opt;
+    j->lastPic = -1;
     snprintf(j->base, sizeof(j->base), "%s", base);
     yuv_tables();
     j->srcBuf = malloc(SRC_BUF);
@@ -1461,10 +1502,15 @@ PrepJob *prep_open(const char *src, const char *base, const PrepOptions *opt, ch
         goto error;
     if (resumed) {
         j->st.resumedFrom = j->s.videoFrames;
-        j->skipCk = 1;   /* the resume point is this very state */
+        j->skipCk = j->s.dirty != 0;
+        j->checkpointTick = j->s.emitted;
         for (int sc = 0; sc < 2; sc++)
             if (j->s.seen[sc] && SCREEN_SHOWN(j, sc))
                 yuv_screen(j, sc);
+        if (!j->s.dirty && j->s.videoFrames) {
+            memcpy(j->pic[0], j->yuv, picBytes);
+            j->lastPic = 0;
+        }
         if (j->audio && j->s.aacHistFill) {   /* warm the new encoder up; its output is in the file */
             j->aacDiscard = j->s.aacHistFill;
             for (uint32_t i = AAC_WARM - j->s.aacHistFill; i < AAC_WARM; i++) {
