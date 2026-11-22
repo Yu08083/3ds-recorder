@@ -43,7 +43,7 @@ https://github.com/user-attachments/assets/122e7c76-d4c6-4f60-9426-aeed7d322776
 
 ## Встановлення
 
-1. Завантажте CIA з [релізу Yu](https://github.com/Yu08083/3ds-recorder/releases/tag/v1.5.0-yu.y01).
+1. Завантажте CIA з [релізу Yu](https://github.com/Yu08083/3ds-recorder/releases/tag/v1.5.0-yu.y02).
 2. Скопіюйте CIA на SD-картку й встановіть через FBI (SD → файл → **Install CIA**) або відкрийте у FBI **Remote Install** → **Scan QR Code** і відскануйте QR-код із релізу.
 3. Увімкніть консоль із затиснутою **SELECT**. У меню Luma увімкніть **Enable loading external FIRMs and modules**
    і збережіть кнопкою **START**.

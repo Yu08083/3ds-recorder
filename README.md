@@ -15,11 +15,11 @@
   <img src="docs/screenshots/en/download.png" width="260" alt="Download to a phone">
 </p>
 
-## Yu ver.y01
+## Yu ver.y02
 
 3DS Recorder v1.5.0（BolgarMaxym97）の改変版です。CTRPluginFrameworkのメニューを開いたとき、上下画面の表示を録画に取り込みます。
 
-[FBI用QR](https://github.com/Yu08083/3ds-recorder/releases/download/v1.5.0-yu.y01/3DS-Recorder-1.5.0-Yu-y01-QR.png) · [CIAをダウンロード](https://github.com/Yu08083/3ds-recorder/releases/download/v1.5.0-yu.y01/3DS-Recorder-1.5.0-Yu-y01.cia)
+[FBI用QR](https://github.com/Yu08083/3ds-recorder/releases/download/v1.5.0-yu.y02/3DS-Recorder-1.5.0-Yu-y02-QR.png) · [CIAをダウンロード](https://github.com/Yu08083/3ds-recorder/releases/download/v1.5.0-yu.y02/3DS-Recorder-1.5.0-Yu-y02.cia)
 
 FBIの「Remote Install」→「Scan QR Code」で導入し、HOMEメニューから「3DS Recorder」を一度開いてください。初回はSELECTを押しながら本体を起動し、Luma設定の「Enable loading external FIRMs and modules」を有効にします。録画の開始・停止はR＋SELECTです。
 
@@ -55,7 +55,7 @@ as it is (400 × 480), only cut shorter.* More, as they came out:
 
 ## Install
 
-1. Download the CIA from the [Yu release](https://github.com/Yu08083/3ds-recorder/releases/tag/v1.5.0-yu.y01).
+1. Download the CIA from the [Yu release](https://github.com/Yu08083/3ds-recorder/releases/tag/v1.5.0-yu.y02).
 2. Copy the CIA to the SD card and install it in FBI, or scan the QR above in FBI's Remote Install.
 3. Turn the console on holding **SELECT**. In the Luma menu turn on **Enable loading external FIRMs and modules**
    and save with **START**.

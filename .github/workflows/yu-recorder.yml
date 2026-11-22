@@ -42,7 +42,10 @@ jobs:
           scratch.mkdir()
           env = build_tools(scratch, 2)
           for folder,target in [('sysmod','all'),('plugin','all'),('app','cia')]:
-              subprocess.run(['make','-j2',target], cwd=folder, check=True, env=env)
+              build_env = env
+              if folder == 'sysmod' and os.environ['GITHUB_REF_NAME'] == 'yu/recorder-1.5.0-y02':
+                  build_env = dict(env, SOURCE_DATE_EPOCH='1795261906')
+              subprocess.run(['make','-j2',target], cwd=folder, check=True, env=build_env)
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
